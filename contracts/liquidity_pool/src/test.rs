@@ -1,8 +1,12 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    Address, Env,
+    Address, Env, String as SorobanString, TryIntoVal,
 };
+
+// Import Vec from alloc for no_std environment
+extern crate alloc;
+use alloc::vec::Vec;
 
 #[test]
 fn test_basic_flow() {
@@ -330,24 +334,151 @@ fn test_events() {
     let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
     let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
 
-    let user = Address::generate(&e);
+    let user1 = Address::generate(&e);
+    let user2 = Address::generate(&e);
 
     e.cost_estimate().budget().reset_unlimited();
 
     client.initialize(&admin, &token_a, &token_b);
 
-    // Mint and deposit
-    token_a_admin.mint(&user, &1000);
-    token_b_admin.mint(&user, &1000);
+    // Mint tokens to users
+    token_a_admin.mint(&user1, &2000);
+    token_b_admin.mint(&user1, &2000);
+    token_a_admin.mint(&user2, &1000);
+    token_b_admin.mint(&user2, &1000);
 
-    client.deposit(&user, &1000, &1000);
+    // === Test Deposit Event ===
+    let deposit_shares = client.deposit(&user1, &1000, &1000);
 
-    // Get all events - should include deposit, swap, withdraw events
-    // Events also include token transfer events from the minting and deposits
     let events = e.events().all();
+    let deposit_event_name = String::from_str(&e, "deposit");
+    let deposit_events: Vec<_> = events
+        .iter()
+        .filter(|(_, topics, _)| {
+            if topics.len() != 2 {
+                return false;
+            }
+            // Compare by converting Val to String
+            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_str.is_ok() && topic_str.unwrap() == deposit_event_name
+        })
+        .collect();
 
-    // Just verify we have events (includes token transfers + our custom events)
-    assert!(!events.is_empty());
+    // Should have exactly one deposit event
+    assert_eq!(deposit_events.len(), 1);
+
+    // Verify deposit event data
+    let (contract_addr, topics, data) = &deposit_events[0];
+    assert_eq!(
+        contract_addr, &contract_id,
+        "Event should be emitted from liquidity pool contract"
+    );
+
+    // Convert topic Val to Address for comparison
+    let topic_user: Address = topics.get(1).unwrap().try_into_val(&e).unwrap();
+    assert_eq!(
+        topic_user, user1,
+        "Deposit event should contain user1 address in topics"
+    );
+
+    // Convert data Val to DepositEvent
+    let deposit_event: DepositEvent = data.try_into_val(&e).unwrap();
+    assert_eq!(deposit_event.user, user1);
+    assert_eq!(deposit_event.amount_a, 1000);
+    assert_eq!(deposit_event.amount_b, 1000);
+    assert_eq!(deposit_event.shares_minted, deposit_shares);
+
+    // === Test Swap Event ===
+    let out_amount = 100;
+    let in_max = 150;
+    let amount_paid = client.swap(&user2, &false, &out_amount, &in_max);
+
+    let events = e.events().all();
+    let swap_event_name = String::from_str(&e, "swap");
+    let swap_events: Vec<_> = events
+        .iter()
+        .filter(|(_, topics, _)| {
+            if topics.len() != 2 {
+                return false;
+            }
+            // Compare by converting Val to String
+            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_str.is_ok() && topic_str.unwrap() == swap_event_name
+        })
+        .collect();
+
+    // Should have exactly one swap event
+    assert_eq!(swap_events.len(), 1);
+
+    // Verify swap event data
+    let (contract_addr, topics, data) = &swap_events[0];
+    assert_eq!(
+        contract_addr, &contract_id,
+        "Event should be emitted from liquidity pool contract"
+    );
+
+    // Convert topic Val to Address for comparison
+    let topic_user: Address = topics.get(1).unwrap().try_into_val(&e).unwrap();
+    assert_eq!(
+        topic_user, user2,
+        "Swap event should contain user2 address in topics"
+    );
+
+    // Convert data Val to SwapEvent
+    let swap_event: SwapEvent = data.try_into_val(&e).unwrap();
+    assert_eq!(swap_event.user, user2);
+    // buy_a = false means we're buying token B (token_out) by paying token A (token_in)
+    assert_eq!(swap_event.token_in, token_a);
+    assert_eq!(swap_event.token_out, token_b);
+    assert_eq!(swap_event.amount_in, amount_paid);
+    assert_eq!(swap_event.amount_out, out_amount);
+
+    // === Test Withdraw Event ===
+    let withdraw_shares = 500;
+    let (withdrawn_a, withdrawn_b) = client.withdraw(&user1, &withdraw_shares);
+
+    let events = e.events().all();
+    let withdraw_event_name = String::from_str(&e, "withdraw");
+    let withdraw_events: Vec<_> = events
+        .iter()
+        .filter(|(_, topics, _)| {
+            if topics.len() != 2 {
+                return false;
+            }
+            // Compare by converting Val to String
+            let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
+            topic_str.is_ok() && topic_str.unwrap() == withdraw_event_name
+        })
+        .collect();
+
+    // Should have exactly one withdraw event
+    assert_eq!(withdraw_events.len(), 1);
+
+    // Verify withdraw event data
+    let (contract_addr, topics, data) = &withdraw_events[0];
+    assert_eq!(
+        contract_addr, &contract_id,
+        "Event should be emitted from liquidity pool contract"
+    );
+
+    // Convert topic Val to Address for comparison
+    let topic_user: Address = topics.get(1).unwrap().try_into_val(&e).unwrap();
+    assert_eq!(
+        topic_user, user1,
+        "Withdraw event should contain user1 address in topics"
+    );
+
+    // Convert data Val to WithdrawEvent
+    let withdraw_event: WithdrawEvent = data.try_into_val(&e).unwrap();
+    assert_eq!(withdraw_event.user, user1);
+    assert_eq!(withdraw_event.shares_burned, withdraw_shares);
+    assert_eq!(withdraw_event.amount_a, withdrawn_a);
+    assert_eq!(withdraw_event.amount_b, withdrawn_b);
+
+    // Verify all event types are present
+    assert!(!deposit_events.is_empty());
+    assert!(!swap_events.is_empty());
+    assert!(!withdraw_events.is_empty());
 }
 
 // ===== Allowance and TransferFrom Tests =====
@@ -493,7 +624,7 @@ fn test_transfer_from() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "Error(Contract, #10)")]
 fn test_transfer_from_insufficient_allowance() {
     let e = Env::default();
     e.mock_all_auths();
@@ -748,8 +879,12 @@ fn test_get_fee_default() {
     let client = LiquidityPoolClient::new(&e, &contract_id);
 
     let admin = Address::generate(&e);
-    let token_a = e.register_stellar_asset_contract_v2(admin.clone()).address();
-    let token_b = e.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
 
     client.initialize(&admin, &token_a, &token_b);
 
@@ -766,8 +901,12 @@ fn test_set_fee_valid() {
     let client = LiquidityPoolClient::new(&e, &contract_id);
 
     let admin = Address::generate(&e);
-    let token_a = e.register_stellar_asset_contract_v2(admin.clone()).address();
-    let token_b = e.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
 
     client.initialize(&admin, &token_a, &token_b);
 
@@ -794,8 +933,12 @@ fn test_set_fee_above_max() {
     let client = LiquidityPoolClient::new(&e, &contract_id);
 
     let admin = Address::generate(&e);
-    let token_a = e.register_stellar_asset_contract_v2(admin.clone()).address();
-    let token_b = e.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
 
     client.initialize(&admin, &token_a, &token_b);
 
@@ -812,8 +955,12 @@ fn test_burn() {
     let client = LiquidityPoolClient::new(&e, &contract_id);
 
     let admin = Address::generate(&e);
-    let token_a = e.register_stellar_asset_contract_v2(admin.clone()).address();
-    let token_b = e.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
 
     let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
     let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
@@ -852,8 +999,12 @@ fn test_burn_insufficient_shares() {
     let client = LiquidityPoolClient::new(&e, &contract_id);
 
     let admin = Address::generate(&e);
-    let token_a = e.register_stellar_asset_contract_v2(admin.clone()).address();
-    let token_b = e.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
 
     let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
     let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
@@ -906,12 +1057,22 @@ fn test_deposit_zero_amount() {
     // --- Scenario 1: First deposit with both amounts = 0 ---
     // sqrt(0 * 0) = 0, so 0 shares should be minted without panicking.
     let shares = client.deposit(&user, &0, &0);
-    assert_eq!(shares, 0, "Depositing (0, 0) as first liquidity must mint 0 shares");
-    assert_eq!(client.total_supply(), 0, "Total supply must remain 0 after zero deposit");
+    assert_eq!(
+        shares, 0,
+        "Depositing (0, 0) as first liquidity must mint 0 shares"
+    );
+    assert_eq!(
+        client.total_supply(),
+        0,
+        "Total supply must remain 0 after zero deposit"
+    );
 
     // --- Scenario 2: Seed the pool with real liquidity, then deposit zero ---
     let initial_shares = client.deposit(&user, &1000, &1000);
-    assert_eq!(initial_shares, 1000, "Initial deposit should mint sqrt(1000*1000) = 1000 shares");
+    assert_eq!(
+        initial_shares, 1000,
+        "Initial deposit should mint sqrt(1000*1000) = 1000 shares"
+    );
 
     let token_a_client = soroban_sdk::token::Client::new(&e, &token_a);
     let token_b_client = soroban_sdk::token::Client::new(&e, &token_b);
@@ -921,7 +1082,10 @@ fn test_deposit_zero_amount() {
     // Deposit 0 of each into a pool that already has reserves
     // Proportional formula: min(0 * total / reserve_a, 0 * total / reserve_b) = 0
     let zero_shares = client.deposit(&user, &0, &0);
-    assert_eq!(zero_shares, 0, "Depositing (0, 0) into funded pool must mint 0 shares");
+    assert_eq!(
+        zero_shares, 0,
+        "Depositing (0, 0) into funded pool must mint 0 shares"
+    );
     assert_eq!(
         client.total_supply(),
         initial_shares,
