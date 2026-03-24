@@ -3,6 +3,7 @@ mod benchmarks;
 mod comparison;
 mod errors;
 pub mod insights;
+mod jobs;
 mod parser;
 pub mod rpc_provider;
 mod simulation;
@@ -10,10 +11,11 @@ mod simulation;
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
 use crate::insights::InsightsEngine;
+use crate::jobs::{JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse};
 use crate::rpc_provider::{ProviderRegistry, RpcProvider};
 use crate::simulation::{SimulationCache, SimulationEngine, SimulationResult};
 use axum::{
-    extract::{Json, Multipart, State},
+    extract::{Json, Multipart, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue},
     middleware,
     routing::{get, post},
@@ -58,10 +60,52 @@ struct AppConfig {
     /// Health-check interval in seconds (default 30).
     #[serde(default = "default_health_check_interval")]
     health_check_interval_secs: u64,
+    /// Simulation timeout in seconds (default 30).
+    #[serde(default = "default_simulation_timeout_secs")]
+    simulation_timeout_secs: u64,
+    /// Job timeout in seconds (default 300).
+    #[serde(default = "default_job_timeout_secs")]
+    job_timeout_secs: u64,
+    /// Job cleanup interval in seconds (default 3600).
+    #[serde(default = "default_job_cleanup_interval_secs")]
+    job_cleanup_interval_secs: u64,
+    /// Job retention time after completion in seconds (default 3600).
+    #[serde(default = "default_job_retention_secs")]
+    job_retention_secs: u64,
+    /// Webhook timeout in seconds (default 10).
+    #[serde(default = "default_webhook_timeout_secs")]
+    webhook_timeout_secs: u64,
+    /// Max webhook retry attempts (default 3).
+    #[serde(default = "default_webhook_max_retries")]
+    webhook_max_retries: u32,
 }
 
 fn default_health_check_interval() -> u64 {
     30
+}
+
+fn default_simulation_timeout_secs() -> u64 {
+    30
+}
+
+fn default_job_timeout_secs() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_job_cleanup_interval_secs() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_job_retention_secs() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_webhook_timeout_secs() -> u64 {
+    10
+}
+
+fn default_webhook_max_retries() -> u32 {
+    3
 }
 
 fn load_config() -> Result<AppConfig, ConfigError> {
@@ -77,6 +121,12 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("redis_url", "redis://127.0.0.1:6379")?
         .set_default("rpc_providers", "")?
         .set_default("health_check_interval_secs", 30)?
+        .set_default("simulation_timeout_secs", 30)?
+        .set_default("job_timeout_secs", 300)?
+        .set_default("job_cleanup_interval_secs", 3600)?
+        .set_default("job_retention_secs", 3600)?
+        .set_default("webhook_timeout_secs", 10)?
+        .set_default("webhook_max_retries", 3)?
         .build()?;
 
     settings.try_deserialize()
@@ -116,10 +166,13 @@ fn build_providers(config: &AppConfig) -> Vec<RpcProvider> {
 
 /// Shared application state injected into every Axum handler via [`State`].
 struct AppState {
-    #[allow(dead_code)] // will be used when RPC simulation is wired into analyze handler
     engine: SimulationEngine,
     cache: Arc<SimulationCache>,
     insights_engine: InsightsEngine,
+    /// Simulation timeout for RPC requests
+    simulation_timeout: std::time::Duration,
+    /// Job queue for background task processing
+    job_queue: Arc<JobQueue>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -151,6 +204,9 @@ pub struct ResourceReport {
     /// Transaction size in bytes
     #[schema(example = 450)]
     pub transaction_size_bytes: u64,
+    /// Estimated cost in stroops
+    #[schema(example = 1000)]
+    pub cost_stroops: u64,
     /// Report showing which data was injected vs live
     pub state_dependency: Option<Vec<StateDependencyReport>>,
     /// Efficiency score (0–100) and optimisation insights.
@@ -216,6 +272,7 @@ fn to_report(result: &SimulationResult, insights_engine: &InsightsEngine) -> Res
         ledger_read_bytes: result.resources.ledger_read_bytes,
         ledger_write_bytes: result.resources.ledger_write_bytes,
         transaction_size_bytes: result.resources.transaction_size_bytes,
+        cost_stroops: result.cost_stroops,
         state_dependency: result.state_dependency.as_ref().map(|deps| {
             deps.iter()
                 .map(|d| StateDependencyReport {
@@ -258,33 +315,69 @@ async fn analyze(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AnalyzeRequest>,
 ) -> Result<(HeaderMap, Json<ResourceReport>), AppError> {
-    tracing::info!(
+    // Create a tracing span with structured fields for this request
+    let span = tracing::info_span!(
+        "analyze",
         contract_id = %payload.contract_id,
         function_name = %payload.function_name,
-        "Received analyze request"
     );
+    let _enter = span.enter();
+
+    tracing::info!("Received analyze request");
 
     let args = payload.args.clone().unwrap_or_default();
     let cache_key =
         SimulationCache::generate_key(&payload.contract_id, &payload.function_name, &args);
 
+    // Track simulation latency
+    let start_time = std::time::Instant::now();
+
     let (result, cache_status): (SimulationResult, &'static str) =
         if let Some(cached) = state.cache.get(&cache_key).await {
+            tracing::debug!("Cache HIT for key: {}", cache_key);
             (cached, "HIT")
         } else {
-            let sim: SimulationResult = state
-                .engine
-                .simulate_from_contract_id(
+            tracing::debug!("Cache MISS for key: {}", cache_key);
+            
+            // Wrap the simulation call with a timeout to prevent hanging
+            let sim_result = tokio::time::timeout(
+                state.simulation_timeout,
+                state.engine.simulate_from_contract_id(
                     &payload.contract_id,
                     &payload.function_name,
                     args,
                     payload.ledger_overrides.clone(),
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("Simulation failed: {}", e)))?;
+                ),
+            )
+            .await
+            .map_err(|_| {
+                tracing::error!("Simulation timed out after {:?}", state.simulation_timeout);
+                AppError::Internal(format!(
+                    "Simulation timed out after {} seconds",
+                    state.simulation_timeout.as_secs()
+                ))
+            })?;
+
+            let sim: SimulationResult = sim_result?;
             state.cache.set(cache_key, sim.clone()).await;
             (sim, "MISS")
         };
+
+    let latency_ms = start_time.elapsed().as_millis() as u64;
+
+    // Log comprehensive simulation metrics
+    tracing::info!(
+        latency_ms = latency_ms,
+        cache_status = cache_status,
+        cpu_instructions = result.resources.cpu_instructions,
+        ram_bytes = result.resources.ram_bytes,
+        ledger_read_bytes = result.resources.ledger_read_bytes,
+        ledger_write_bytes = result.resources.ledger_write_bytes,
+        transaction_size_bytes = result.resources.transaction_size_bytes,
+        cost_stroops = result.cost_stroops,
+        latest_ledger = result.latest_ledger,
+        "Simulation completed successfully"
+    );
 
     state.cache.log_stats();
 
@@ -292,6 +385,11 @@ async fn analyze(
     headers.insert(
         HeaderName::from_static("x-soroscope-cache"),
         HeaderValue::from_static(cache_status),
+    );
+    headers.insert(
+        HeaderName::from_static("x-soroscope-latency-ms"),
+        HeaderValue::from_str(&latency_ms.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
 
     Ok((headers, Json(to_report(&result, &state.insights_engine))))
@@ -477,6 +575,117 @@ async fn compare_handler(
     Ok(Json(CompareApiResponse { report }))
 }
 
+// ── Job handlers ─────────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    post,
+    path = "/jobs/submit",
+    request_body = SubmitJobRequest,
+    responses(
+        (status = 200, description = "Job submitted successfully", body = SubmitJobResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(
+        ("jwt" = [])
+    ),
+    tag = "Jobs"
+)]
+async fn submit_job(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SubmitJobRequest>,
+) -> Result<Json<SubmitJobResponse>, AppError> {
+    tracing::info!(job_type = ?payload.job_type, "Received job submission");
+
+    let job_id = state
+        .job_queue
+        .submit(payload.job_type, payload.payload, payload.webhook)
+        .await;
+
+    tracing::info!(job_id = %job_id, "Job submitted successfully");
+
+    Ok(Json(SubmitJobResponse {
+        job_id: job_id.to_string(),
+        status: crate::jobs::JobStatus::Queued,
+        message: "Job submitted successfully".to_string(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/jobs/{id}",
+    params(
+        ("id" = String, Path, description = "Job ID")
+    ),
+    responses(
+        (status = 200, description = "Job status retrieved", body = crate::jobs::Job),
+        (status = 404, description = "Job not found"),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(
+        ("jwt" = [])
+    ),
+    tag = "Jobs"
+)]
+async fn get_job_status(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<crate::jobs::Job>, AppError> {
+    let id: JobId = job_id.parse().map_err(|_| {
+        AppError::BadRequest("Invalid job ID format".to_string())
+    })?;
+
+    let job = state
+        .job_queue
+        .get_status(&id)
+        .ok_or_else(|| AppError::NotFound(format!("Job not found: {}", job_id)))?;
+
+    Ok(Json(job))
+}
+
+#[utoipa::path(
+    post,
+    path = "/jobs/{id}/cancel",
+    params(
+        ("id" = String, Path, description = "Job ID")
+    ),
+    responses(
+        (status = 200, description = "Job cancelled", body = crate::jobs::Job),
+        (status = 400, description = "Cannot cancel job in current state"),
+        (status = 404, description = "Job not found"),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(
+        ("jwt" = [])
+    ),
+    tag = "Jobs"
+)]
+async fn cancel_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<crate::jobs::Job>, AppError> {
+    let id: JobId = job_id.parse().map_err(|_| {
+        AppError::BadRequest("Invalid job ID format".to_string())
+    })?;
+
+    let job = state
+        .job_queue
+        .cancel(&id)
+        .map_err(|e| match e {
+            crate::jobs::JobError::NotFound(_) => {
+                AppError::NotFound(format!("Job not found: {}", job_id))
+            }
+            crate::jobs::JobError::CannotCancel(status) => {
+                AppError::BadRequest(format!("Cannot cancel job in status: {:?}", status))
+            }
+            _ => AppError::Internal(e.to_string()),
+        })?;
+
+    tracing::info!(job_id = %job_id, "Job cancelled");
+
+    Ok(Json(job))
+}
+
 /// Write WASM bytes to a temporary file and return the path.
 fn write_temp_wasm(bytes: &[u8]) -> Result<std::path::PathBuf, AppError> {
     use std::io::Write;
@@ -494,11 +703,19 @@ fn write_temp_wasm(bytes: &[u8]) -> Result<std::path::PathBuf, AppError> {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(analyze, optimize_limits, compare_handler, auth::challenge_handler, auth::verify_handler),
+    paths(
+        analyze, optimize_limits, compare_handler,
+        submit_job, get_job_status, cancel_job,
+        auth::challenge_handler, auth::verify_handler
+    ),
     components(schemas(
         AnalyzeRequest, ResourceReport,
         OptimizeLimitsRequest, OptimizeLimitsResponse,
         CompareApiResponse, RegressionReport, ResourceDelta, RegressionFlag,
+        SubmitJobRequest, SubmitJobResponse,
+        crate::jobs::Job, crate::jobs::JobId, crate::jobs::JobStatus,
+        crate::jobs::JobType, crate::jobs::JobPayload, crate::jobs::JobResult,
+        crate::jobs::JobProgress, crate::jobs::WebhookConfig,
         auth::ChallengeRequest, auth::ChallengeResponse,
         auth::VerifyRequest, auth::VerifyResponse,
         crate::simulation::OptimizationBuffer,
@@ -506,6 +723,7 @@ fn write_temp_wasm(bytes: &[u8]) -> Result<std::path::PathBuf, AppError> {
     )),
     tags(
         (name = "Analysis", description = "Soroban contract resource analysis endpoints"),
+        (name = "Jobs", description = "Background job queue for async analysis"),
         (name = "Auth", description = "SEP-10 wallet authentication")
     ),
     info(
@@ -646,10 +864,51 @@ async fn main() {
         "Background RPC health checker started"
     );
 
+    let simulation_timeout = std::time::Duration::from_secs(config.simulation_timeout_secs);
+    tracing::info!(timeout_secs = config.simulation_timeout_secs, "Simulation timeout configured");
+
+    // ── Job Queue setup ─────────────────────────────────────────────────
+    let job_queue_config = JobQueueConfig {
+        job_timeout_secs: config.job_timeout_secs,
+        cleanup_interval_secs: config.job_cleanup_interval_secs,
+        retention_secs: config.job_retention_secs,
+        webhook_timeout_secs: config.webhook_timeout_secs,
+        webhook_max_retries: config.webhook_max_retries,
+    };
+    
+    let (job_queue, job_receiver) = JobQueue::new(job_queue_config.clone());
+    let job_queue = Arc::new(job_queue);
+    
+    // Spawn job worker
+    let job_worker = JobWorker::new(
+        job_receiver,
+        job_queue.jobs_clone(),
+        SimulationEngine::with_registry_and_timeout(Arc::clone(&registry), simulation_timeout),
+        InsightsEngine::new(),
+        job_queue_config.clone(),
+    );
+    let _worker_handle = tokio::spawn(async move {
+        job_worker.run().await;
+    });
+    tracing::info!("Job worker started");
+    
+    // Spawn cleanup task
+    let _cleanup_handle = job_queue.spawn_cleanup_task();
+    tracing::info!(
+        interval_secs = job_queue_config.cleanup_interval_secs,
+        retention_secs = job_queue_config.retention_secs,
+        "Job cleanup task started"
+    );
+
     let app_state = Arc::new(AppState {
-        engine: SimulationEngine::with_registry(Arc::clone(&registry)),
+        engine: SimulationEngine::with_registry_and_timeout(
+            Arc::clone(&registry),
+            simulation_timeout,
+        ),
         cache: SimulationCache::new(),
         insights_engine: InsightsEngine::new(),
+        simulation_timeout,
+        job_queue,
     });
 
     let cors = CorsLayer::new().allow_origin(Any);
@@ -658,6 +917,9 @@ async fn main() {
         .route("/analyze", post(analyze))
         .route("/analyze/optimize-limits", post(optimize_limits))
         .route("/analyze/compare", post(compare_handler))
+        .route("/jobs/submit", post(submit_job))
+        .route("/jobs/:id", get(get_job_status))
+        .route("/jobs/:id/cancel", post(cancel_job))
         .route_layer(middleware::from_fn(auth::auth_middleware));
 
     let app = Router::new()
@@ -694,4 +956,126 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("Server failed to start");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Integration Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::{SimulationError, SorobanResources};
+
+    #[test]
+    fn test_error_mapping_node_error() {
+        let sim_err = SimulationError::NodeError("Invalid contract ID".to_string());
+        let app_err: AppError = sim_err.into();
+        
+        match app_err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("Invalid contract ID"));
+            }
+            _ => panic!("Expected BadRequest, got {:?}", app_err),
+        }
+    }
+
+    #[test]
+    fn test_error_mapping_invalid_contract() {
+        let sim_err = SimulationError::InvalidContract("Contract not found".to_string());
+        let app_err: AppError = sim_err.into();
+        
+        match app_err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("Contract not found"));
+            }
+            _ => panic!("Expected BadRequest, got {:?}", app_err),
+        }
+    }
+
+    #[test]
+    fn test_error_mapping_timeout() {
+        let sim_err = SimulationError::NodeTimeout;
+        let app_err: AppError = sim_err.into();
+        
+        match app_err {
+            AppError::Internal(msg) => {
+                assert!(msg.contains("timed out"));
+            }
+            _ => panic!("Expected Internal, got {:?}", app_err),
+        }
+    }
+
+    #[test]
+    fn test_error_mapping_rpc_request_failed() {
+        let sim_err = SimulationError::RpcRequestFailed("Connection refused".to_string());
+        let app_err: AppError = sim_err.into();
+        
+        match app_err {
+            AppError::Internal(msg) => {
+                assert!(msg.contains("Connection refused"));
+            }
+            _ => panic!("Expected Internal, got {:?}", app_err),
+        }
+    }
+
+    #[test]
+    fn test_error_mapping_network_error() {
+        // Create a mock reqwest error (we can't easily create one, so test via RpcRequestFailed)
+        let sim_err = SimulationError::RpcRequestFailed("Network unreachable".to_string());
+        let app_err: AppError = sim_err.into();
+        
+        match app_err {
+            AppError::Internal(msg) => {
+                assert!(msg.contains("Network unreachable"));
+            }
+            _ => panic!("Expected Internal, got {:?}", app_err),
+        }
+    }
+
+    #[test]
+    fn test_resource_report_includes_cost_stroops() {
+        let sim_result = SimulationResult {
+            resources: SorobanResources {
+                cpu_instructions: 1000000,
+                ram_bytes: 2048,
+                ledger_read_bytes: 512,
+                ledger_write_bytes: 256,
+                transaction_size_bytes: 1024,
+            },
+            transaction_hash: None,
+            latest_ledger: 12345,
+            cost_stroops: 5000,
+            state_dependency: None,
+            transaction_data: "AAA".to_string(),
+        };
+
+        let insights_engine = InsightsEngine::new();
+        let report = to_report(&sim_result, &insights_engine);
+
+        assert_eq!(report.cost_stroops, 5000);
+        assert_eq!(report.cpu_instructions, 1000000);
+        assert_eq!(report.ram_bytes, 2048);
+        assert_eq!(report.ledger_read_bytes, 512);
+        assert_eq!(report.ledger_write_bytes, 256);
+        assert_eq!(report.transaction_size_bytes, 1024);
+    }
+
+    #[test]
+    fn test_app_config_default_simulation_timeout() {
+        // Verify the default timeout function returns 30 seconds
+        assert_eq!(default_simulation_timeout_secs(), 30);
+    }
+
+    #[test]
+    fn test_simulation_engine_timeout_configurable() {
+        use std::time::Duration;
+        
+        // Create a mock registry (we can't easily create one without mocking)
+        // Instead, test that the SimulationEngine has timeout methods
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        
+        // Default should be 30 seconds
+        assert_eq!(engine.timeout(), Duration::from_secs(30));
+    }
 }
